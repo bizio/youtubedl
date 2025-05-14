@@ -7,13 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
-
-	"log/slog"
+	"time"
 )
 
 const (
@@ -24,12 +25,12 @@ const (
 	playerParams = "CgIQBg=="
 )
 
-var (
-	ErrNoFormat = errors.New("no video format provided")
-)
+const ContentPlaybackNonceAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+var ErrNoFormat = errors.New("no video format provided")
 
 // DefaultClient type to use. No reason to change but you could if you wanted to.
-var DefaultClient = AndroidClient
+var DefaultClient = IOSClient
 
 // Client offers methods to download video metadata and video streams.
 type Client struct {
@@ -49,6 +50,11 @@ type Client struct {
 	client *clientInfo
 
 	consentID string
+
+	visitorId struct {
+		value   string
+		updated time.Time
+	}
 }
 
 func (c *Client) assureClient() {
@@ -159,6 +165,8 @@ type innertubeClient struct {
 	UserAgent         string `json:"userAgent,omitempty"`
 	TimeZone          string `json:"timeZone"`
 	UTCOffset         int    `json:"utcOffsetMinutes"`
+	DeviceModel       string `json:"deviceModel,omitempty"`
+	VisitorData       string `json:"visitorData,omitempty"`
 }
 
 // client info for the innertube API
@@ -168,6 +176,7 @@ type clientInfo struct {
 	version        string
 	userAgent      string
 	androidVersion int
+	deviceModel    string
 }
 
 var (
@@ -188,6 +197,15 @@ var (
 		androidVersion: 30,
 	}
 
+	// IOSClient Client based brrrr.
+	IOSClient = clientInfo{
+		name:        "IOS",
+		version:     "19.45.4",
+		key:         "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+		userAgent:   "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
+		deviceModel: "iPhone16,2",
+	}
+
 	// EmbeddedClient, not really tested.
 	EmbeddedClient = clientInfo{
 		name:      "WEB_EMBEDDED_PLAYER",
@@ -203,7 +221,7 @@ func (c *Client) videoDataByInnertube(ctx context.Context, id string) ([]byte, e
 		Context:        prepareInnertubeContext(*c.client),
 		ContentCheckOK: true,
 		RacyCheckOk:    true,
-		Params:         playerParams,
+		// Params:                   playerParams,
 		PlaybackContext: &playbackContext{
 			ContentPlaybackContext: contentPlaybackContext{
 				// SignatureTimestamp: sts,
@@ -224,16 +242,45 @@ func (c *Client) transcriptDataByInnertube(ctx context.Context, id string, lang 
 	return c.httpPostBodyBytes(ctx, "https://www.youtube.com/youtubei/v1/get_transcript?key="+c.client.key, data)
 }
 
+func randString(alphabet string, sz int) string {
+	var buf strings.Builder
+	buf.Grow(sz)
+	for i := 0; i < sz; i++ {
+		buf.WriteByte(alphabet[rand.Intn(len(alphabet))])
+	}
+	return buf.String()
+}
+
+func randomVisitorData(countryCode string) string {
+	var pbE2 ProtoBuilder
+
+	pbE2.String(2, "")
+	pbE2.Varint(4, int64(rand.Intn(255)+1))
+
+	var pbE ProtoBuilder
+	pbE.String(1, countryCode)
+	pbE.Bytes(2, pbE2.ToBytes())
+
+	var pb ProtoBuilder
+	pb.String(1, randString(ContentPlaybackNonceAlphabet, 11))
+	pb.Varint(5, time.Now().Unix()-int64(rand.Intn(600000)))
+	pb.Bytes(6, pbE.ToBytes())
+
+	return pb.ToURLEncodedBase64()
+}
+
 func prepareInnertubeContext(clientInfo clientInfo) inntertubeContext {
 	return inntertubeContext{
 		Client: innertubeClient{
 			HL:                "en",
 			GL:                "US",
 			TimeZone:          "UTC",
+			DeviceModel:       clientInfo.deviceModel,
 			ClientName:        clientInfo.name,
 			ClientVersion:     clientInfo.version,
 			AndroidSDKVersion: clientInfo.androidVersion,
 			UserAgent:         clientInfo.userAgent,
+			VisitorData:       randomVisitorData("US"),
 		},
 	}
 }
@@ -427,7 +474,6 @@ func (c *Client) downloadChunked(ctx context.Context, req *http.Request, w *io.P
 				return
 			case data := <-chunks[i].data:
 				_, err := io.Copy(w, bytes.NewBuffer(data))
-
 				if err != nil {
 					abort(err)
 				}
@@ -501,6 +547,12 @@ func (c *Client) httpDo(req *http.Request) (*http.Response, error) {
 
 	log := slog.With("method", req.Method, "url", req.URL)
 
+	if err == nil && res.StatusCode != http.StatusOK {
+		err = ErrUnexpectedStatusCode(res.StatusCode)
+		res.Body.Close()
+		res = nil
+	}
+
 	if err != nil {
 		log.Debug("HTTP request failed", "error", err)
 	} else {
@@ -558,6 +610,12 @@ func (c *Client) httpPost(ctx context.Context, url string, body interface{}) (*h
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
+	if xgoogvisitorid, err := c.getVisitorId(); err != nil {
+		return nil, err
+	} else {
+		req.Header.Set("x-goog-visitor-id", xgoogvisitorid)
+	}
+
 	resp, err := c.httpDo(req)
 	if err != nil {
 		return nil, err
@@ -569,6 +627,57 @@ func (c *Client) httpPost(ctx context.Context, url string, body interface{}) (*h
 	}
 
 	return resp, nil
+}
+
+var VisitorIdMaxAge = 10 * time.Hour
+
+func (c *Client) getVisitorId() (string, error) {
+	var err error
+	if c.visitorId.value == "" || time.Since(c.visitorId.updated) > VisitorIdMaxAge {
+		err = c.refreshVisitorId()
+	}
+
+	return c.visitorId.value, err
+}
+
+func (c *Client) refreshVisitorId() error {
+	const sep = "\nytcfg.set("
+
+	req, err := http.NewRequest(http.MethodGet, "https://www.youtube.com", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpDo(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	_, data1, found := strings.Cut(string(data), sep)
+	if !found {
+		return err
+	}
+	var value struct {
+		InnertubeContext struct {
+			Client struct {
+				VisitorData string
+			}
+		} `json:"INNERTUBE_CONTEXT"`
+	}
+	if err := json.NewDecoder(strings.NewReader(data1)).Decode(&value); err != nil {
+		return err
+	}
+
+	if c.visitorId.value, err = url.PathUnescape(value.InnertubeContext.Client.VisitorData); err != nil {
+		return err
+	}
+
+	c.visitorId.updated = time.Now()
+	return nil
 }
 
 // httpPostBodyBytes reads the whole HTTP body and returns it
@@ -596,7 +705,7 @@ func (c *Client) downloadChunk(req *http.Request, chunk *chunk) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < http.StatusOK && resp.StatusCode >= 300 {
+	if resp.StatusCode != http.StatusOK {
 		return ErrUnexpectedStatusCode(resp.StatusCode)
 	}
 
